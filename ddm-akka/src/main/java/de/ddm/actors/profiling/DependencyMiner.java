@@ -1,3 +1,4 @@
+
 package de.ddm.actors.profiling;
 
 import akka.actor.typed.ActorRef;
@@ -18,12 +19,11 @@ import de.ddm.utils.MemoryUtils;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
 
 import java.io.File;
 import java.io.FileNotFoundException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 
 public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 
@@ -149,57 +149,198 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		return this;
 	}
 
-	private Behavior<Message> handle(BatchMessage message) {
-		// Ignoring batch content for now ... but I could do so much with it.
+	private final Map<Integer, Map<String, Set<String>>> columnValues = new HashMap<>();
+	private Map<Integer, Boolean> fileCompletionFlags = new HashMap<>();  // Keep track of file completion
 
-//		System.out.println(MemoryUtils.byteSizeOf(message.getBatch()));
-//		System.out.println(MemoryUtils.bytesMax() + "    " + MemoryUtils.bytesFree());
+	static int inputReaderCounter = 0;
+	private Behavior<Message> handle(BatchMessage message) {
+
+
+		List<String[]> batch = message.getBatch();
+		int fileId = message.getId();
+
+		// Ensure columnValues map is initialized for the file
+		columnValues.putIfAbsent(fileId, new HashMap<>());
+
+		// Process each row in the batch
+		for (String[] row : batch) {
+			for (int colIndex = 0; colIndex < row.length; colIndex++) {
+				String columnName = "Column_" + colIndex;
+				columnValues.get(fileId)
+						.computeIfAbsent(columnName, k -> new HashSet<>())
+						.add(row[colIndex]);
+			}
+		}
+		// If the batch is empty, this could be the end of data for this file
+		if (batch.isEmpty()) {
+			// If there is no more data, we set a completion flag for the file
+			fileCompletionFlags.put(fileId, true);
+			inputReaderCounter++;
+		}
+		this.getContext().getLog().info("InputReader"+inputReaders.size()+"Count"+inputReaderCounter+"file"+inputFiles.length);
+		if(inputReaderCounter == inputFiles.length) {
+			distributeWorkToWorkers();
+		}
+
 
 		if (!message.getBatch().isEmpty())
 			this.inputReaders.get(message.getId()).tell(new InputReader.ReadBatchMessage(this.getContext().getSelf(), 10000));
+		else {
+			this.getContext().getLog().info("All batches processed for InputReader " + message.getId());
+		}
+
 		return this;
+
 	}
 
+
+	private int count=0;
+	private void distributeWorkToWorkers() {
+		if(workerAvailable){
+		List<ActorRef<DependencyWorker.Message>> workers = new ArrayList<>();
+
+		for (Integer fileId1 : columnValues.keySet()) {
+			Map<String, Set<String>> dependentColumns = columnValues.get(fileId1);
+
+			// Self-comparison within the same file
+			for (Map.Entry<String, Set<String>> dependentEntry : dependentColumns.entrySet()) {
+				for (Map.Entry<String, Set<String>> referencedEntry : dependentColumns.entrySet()) {
+					if (dependentEntry.getKey().equals(referencedEntry.getKey())) continue;
+
+					// Unique worker name for self-comparison
+					String workerName = "dependencyWorker-" + fileId1 + "-self-" + count++;
+					ActorRef<DependencyWorker.Message> worker = this.getContext().spawn(
+							DependencyWorker.create(),
+							workerName
+					);
+
+					workers.add(worker);
+					workerTaskDetails.put(worker, new TaskDetails(
+							fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
+							fileId1, referencedEntry.getKey(), referencedEntry.getValue()
+					));
+
+					// Create a TaskMessage for this combination
+					DependencyWorker.TaskMessage taskMessage = new DependencyWorker.TaskMessage(
+							this.largeMessageProxy,
+							new TaskDetails(
+									fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
+									fileId1, referencedEntry.getKey(), referencedEntry.getValue()
+							)
+					);
+					// Send the TaskMessage to the worker
+					if (dependentEntry.getValue() == null || dependentEntry.getValue().isEmpty() ||
+							referencedEntry.getValue() == null || referencedEntry.getValue().isEmpty())
+						this.getContext().getLog().info("Worker " + workerName + " is empty");
+					String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + fileId1 + "-" + referencedEntry.getKey();
+					this.getContext().getLog().info(taskKey + " " + worker);
+
+					worker.tell(taskMessage);
+				}
+			}
+
+			// Comparison across different files
+			for (Map.Entry<Integer, Map<String, Set<String>>> otherFileEntry : columnValues.entrySet()) {
+				int otherFileId = otherFileEntry.getKey();
+				if (otherFileId == fileId1) continue;
+
+				Map<String, Set<String>> referencedColumns = otherFileEntry.getValue();
+
+				for (Map.Entry<String, Set<String>> dependentEntry : dependentColumns.entrySet()) {
+					for (Map.Entry<String, Set<String>> referencedEntry : referencedColumns.entrySet()) {
+
+						// Unique worker name for comparison across files
+						String workerName = "dependencyWorker-" + fileId1 + "-" + otherFileId + "-cross-" + count++;
+						ActorRef<DependencyWorker.Message> worker = this.getContext().spawn(
+								DependencyWorker.create(),
+								workerName
+						);
+						workers.add(worker);
+						workerTaskDetails.put(worker, new TaskDetails(
+								fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
+								otherFileId, referencedEntry.getKey(), referencedEntry.getValue()
+						));
+
+						// Create a TaskMessage for this combination
+						DependencyWorker.TaskMessage taskMessage = new DependencyWorker.TaskMessage(
+								this.largeMessageProxy,  // The reference to the LargeMessageProxy actor
+								new TaskDetails(
+										fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
+										otherFileId, referencedEntry.getKey(), referencedEntry.getValue()
+								)   // Second file ID and its columns
+						);
+
+						// Send the TaskMessage to the worker
+						if (dependentEntry.getValue() == null || dependentEntry.getValue().isEmpty() ||
+								referencedEntry.getValue() == null || referencedEntry.getValue().isEmpty())
+							this.getContext().getLog().info("Worker " + workerName + " is empty");
+						String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + otherFileId + "-" + referencedEntry.getKey();
+						this.getContext().getLog().info(taskKey + " Creating " + worker);
+
+						worker.tell(taskMessage);
+					}
+				}
+			}
+		}
+		}else {
+			this.getContext().getLog().info("No Worker. Waiting for active workers");
+		}
+	}
+
+
+	private boolean workerAvailable=false;
 	private Behavior<Message> handle(RegistrationMessage message) {
 		ActorRef<DependencyWorker.Message> dependencyWorker = message.getDependencyWorker();
 		if (!this.dependencyWorkers.contains(dependencyWorker)) {
 			this.dependencyWorkers.add(dependencyWorker);
 			this.getContext().watch(dependencyWorker);
+			if(!workerAvailable) {
+				workerAvailable = true;
+				distributeWorkToWorkers();
+			}
 			// The worker should get some work ... let me send her something before I figure out what I actually want from her.
 			// I probably need to idle the worker for a while, if I do not have work for it right now ... (see master/worker pattern)
-
-			dependencyWorker.tell(new DependencyWorker.TaskMessage(this.largeMessageProxy, 42));
+			//this.getContext().getLog().info("Registered dependency worker " + dependencyWorker);
+			//dependencyWorker.tell(new DependencyWorker.TaskMessage(this.largeMessageProxy, 42,null,42,null));
 		}
 		return this;
+
+
 	}
 
+	private static int ind_Count=0;
 	private Behavior<Message> handle(CompletionMessage message) {
 		ActorRef<DependencyWorker.Message> dependencyWorker = message.getDependencyWorker();
-		// If this was a reasonable result, I would probably do something with it and potentially generate more work ... for now, let's just generate a random, binary IND.
+		int result = message.getResult();
 
-		if (this.headerLines[0] != null) {
-			Random random = new Random();
-			int dependent = random.nextInt(this.inputFiles.length);
-			int referenced = random.nextInt(this.inputFiles.length);
-			File dependentFile = this.inputFiles[dependent];
-			File referencedFile = this.inputFiles[referenced];
-			String[] dependentAttributes = {this.headerLines[dependent][random.nextInt(this.headerLines[dependent].length)], this.headerLines[dependent][random.nextInt(this.headerLines[dependent].length)]};
-			String[] referencedAttributes = {this.headerLines[referenced][random.nextInt(this.headerLines[referenced].length)], this.headerLines[referenced][random.nextInt(this.headerLines[referenced].length)]};
-			InclusionDependency ind = new InclusionDependency(dependentFile, dependentAttributes, referencedFile, referencedAttributes);
-			List<InclusionDependency> inds = new ArrayList<>(1);
-			inds.add(ind);
+		// Retrieve task details associated with the worker (dependencyWorker)
+		TaskDetails taskDetails = workerTaskDetails.get(dependencyWorker);
 
-			this.resultCollector.tell(new ResultCollector.ResultMessage(inds));
+		if (taskDetails != null) {
+			// Process the task details and result
+			int fileId1 = taskDetails.fileId1;
+			String file1ColumnHeader= taskDetails.File1ColumnHeader;
+			Set<String> file1Columns = taskDetails.file1Columns;
+			int fileId2 = taskDetails.fileId2;
+			String file2ColumnHeader= taskDetails.File2ColumnHeader;
+			Set<String> file2Columns = taskDetails.file2Columns;
+
+			// Log or process the result
+			if(result==1) {
+				ind_Count++;
+				this.getContext().getLog().info(
+						"IND Status: " + " (F " + fileId1 +" "+ file1ColumnHeader+ ") ⊆ " +
+								" (F" + fileId2 + " "+ file2ColumnHeader+" Total "   +" count " + ind_Count);
+			}
+			// Optionally, you can perform further processing, aggregate results, or notify other actors
+		} else {
+			this.getContext().getLog().error("No task details found for worker: " + dependencyWorker);
 		}
-		// I still don't know what task the worker could help me to solve ... but let me keep her busy.
-		// Once I found all unary INDs, I could check if this.discoverNaryDependencies is set to true and try to detect n-ary INDs as well!
 
-		dependencyWorker.tell(new DependencyWorker.TaskMessage(this.largeMessageProxy, 42));
-
-		// At some point, I am done with the discovery. That is when I should call my end method. Because I do not work on a completable task yet, I simply call it after some time.
-		if (System.currentTimeMillis() - this.startTime > 2000000)
-			this.end();
+		// Remove the worker from the task details map after processing
+		workerTaskDetails.remove(dependencyWorker);
 		return this;
+
 	}
 
 	private void end() {
@@ -213,4 +354,22 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		this.dependencyWorkers.remove(dependencyWorker);
 		return this;
 	}
+
+	private final Map<ActorRef<DependencyWorker.Message>, TaskDetails> workerTaskDetails = new HashMap<>();
+
+	// TaskDetails class to hold the file and column data for each task
+
+
+	@Getter @Setter
+	@AllArgsConstructor
+	public static class TaskDetails {
+		int fileId1;
+		String File1ColumnHeader;
+		Set<String> file1Columns;
+		int fileId2;
+		String File2ColumnHeader;
+		Set<String> file2Columns;
+	}
+
 }
+
