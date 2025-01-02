@@ -1,6 +1,5 @@
 
 
-
 package de.ddm.actors.profiling;
 
 import akka.actor.typed.ActorRef;
@@ -12,16 +11,11 @@ import akka.actor.typed.javadsl.Receive;
 import akka.actor.typed.receptionist.Receptionist;
 import de.ddm.actors.patterns.LargeMessageProxy;
 import de.ddm.serialization.AkkaSerializable;
-import de.ddm.structures.InclusionDependency;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 
-import java.io.File;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
-import java.util.Set;
+import java.util.*;
 
 public class DependencyWorker extends AbstractBehavior<DependencyWorker.Message> {
 
@@ -46,8 +40,22 @@ public class DependencyWorker extends AbstractBehavior<DependencyWorker.Message>
 	public static class TaskMessage implements Message {
 		private static final long serialVersionUID = -4667745204456518160L;
 		ActorRef<LargeMessageProxy.Message> dependencyMinerLargeMessageProxy;
-		DependencyMiner.TaskDetails taskDetails;
+		int task;
+	}
 
+	@Getter
+	@AllArgsConstructor
+	public static class TaskDetails implements DependencyWorker.Message, LargeMessageProxy.LargeMessage {
+		private static final long serialVersionUID = 3879890900848542869L;
+		private final ActorRef<DependencyMiner.Message> dependencyMinerRef;
+		int fileId1;
+		String file1ColumnHeader;
+		int fileId2;
+		String file2ColumnHeader;
+	}
+
+	public static class ShutdownMessage implements Message {
+		private static final long serialVersionUID = -4932562889190683168L;
 	}
 
 	////////////////////////
@@ -69,7 +77,6 @@ public class DependencyWorker extends AbstractBehavior<DependencyWorker.Message>
 		this.largeMessageProxy = this.getContext().spawn(LargeMessageProxy.create(this.getContext().getSelf().unsafeUpcast()), LargeMessageProxy.DEFAULT_NAME);
 	}
 
-
 	/////////////////
 	// Actor State //
 	/////////////////
@@ -85,7 +92,76 @@ public class DependencyWorker extends AbstractBehavior<DependencyWorker.Message>
 		return newReceiveBuilder()
 				.onMessage(ReceptionistListingMessage.class, this::handle)
 				.onMessage(TaskMessage.class, this::handle)
+				.onMessage(TaskDetails.class,this::handle)
+				.onMessage(DataChunkMessage.class, this::handle)
+				.onMessage(ShutdownMessage.class, this::handle)
 				.build();
+	}
+
+	private final Map<String, Set<String>> firstColumnData = new HashMap<>();
+	private final Map<String, Set<String>> secondColumnData = new HashMap<>();
+
+	private Behavior<Message> handle(DataChunkMessage chunkMessage) {
+		if (chunkMessage.getChunkValues() == null || chunkMessage.getChunkValues().isEmpty()) {
+			this.getContext().getLog().error("Received an empty or null chunk");
+			return this;
+		}
+
+		int result = 0;
+		ActorRef<DependencyMiner.Message> minerRef = chunkMessage.getDependencyMinerRef();
+		String taskId = chunkMessage.getTaskId();
+		boolean isLastChunk = chunkMessage.isLastChunk();
+		boolean isFirstColumnValues = chunkMessage.isFirstColumnValues();
+		Set<String> chunk = chunkMessage.getChunkValues();
+
+		if (isFirstColumnValues) {
+			firstColumnData.putIfAbsent(taskId, new HashSet<>());
+			firstColumnData.get(taskId).addAll(chunk);
+		} else {
+			secondColumnData.putIfAbsent(taskId, new HashSet<>());
+			secondColumnData.get(taskId).addAll(chunk);
+		}
+
+		if (isLastChunk) {
+			// Mark task as complete if both dependent and referenced are finished
+			if (firstColumnData.containsKey(taskId) && secondColumnData.containsKey(taskId)) {
+				this.getContext().getLog().info("Task complete for {}. Dependent: {}, Referenced: {}", taskId, firstColumnData.size(), secondColumnData.size());
+				// Call a method to process the task (e.g., discover INDs)
+				Set<String> firstColumnValues = firstColumnData.get(taskId);
+				Set<String> secondColumnValues = secondColumnData.get(taskId);
+				result = testIND(firstColumnValues, secondColumnValues);
+				DependencyMiner.CompletionMessage completionMessage = new DependencyMiner.CompletionMessage(
+						this.getContext().getSelf(),
+						result
+				);
+				minerRef.tell(completionMessage);
+			}
+		}
+		return this;
+	}
+
+	private Behavior<Message> handle(TaskDetails taskDetails) {
+		ActorRef<DependencyMiner.Message> minerActorRef = taskDetails.dependencyMinerRef;
+		int fileId1 = taskDetails.getFileId1();
+		String file1ColumnHeader = taskDetails.getFile1ColumnHeader();
+		int fileId2 = taskDetails.getFileId2();
+		String file2ColumnHeader = taskDetails.getFile2ColumnHeader();
+
+		return this;
+	}
+
+	private static int counttestINDExecutionNo =0;
+	private int testIND(Set<String> firstColumn, Set<String> secondColumn) {
+		counttestINDExecutionNo++;
+		int result=0;
+		this.getContext().getLog().info("Processing task with dependent size {} and referenced size {} count {}",
+				firstColumn.size(), secondColumn.size(),counttestINDExecutionNo);
+		// Example: Check if dependent is a subset of referenced
+		if (new HashSet<>(secondColumn).containsAll(firstColumn)) {
+			result = 1;
+			this.getContext().getLog().info("IND Found for task count {} ", counttestINDExecutionNo );
+		}
+		return result;
 	}
 
 	private Behavior<Message> handle(ReceptionistListingMessage message) {
@@ -96,64 +172,15 @@ public class DependencyWorker extends AbstractBehavior<DependencyWorker.Message>
 	}
 
 	private Behavior<Message> handle(TaskMessage message) {
-		int fileId1 = message.getTaskDetails().fileId1;
-		Set<String> file1Columns = message.getTaskDetails().file1Columns;
-		String file1ColumnHeader=message.getTaskDetails().File1ColumnHeader;
-		int fileId2 = message.getTaskDetails().fileId2;
-		String file2ColumnHeader=message.getTaskDetails().File2ColumnHeader;
-		Set<String> file2Columns = message.getTaskDetails().file2Columns;
 
-
-		// Process the columns of both files to find Inclusion Dependencies (INDs)
-		List<InclusionDependency> discoveredInds = discoverInds(fileId1, file1ColumnHeader,file1Columns, fileId2, file2ColumnHeader,file2Columns);
-
-		int result=discoveredInds.size();
-		// Create the CompletionMessage with the necessary details
-		DependencyMiner.CompletionMessage completionMessage = new DependencyMiner.CompletionMessage(
-				this.getContext().getSelf(),   // The worker's reference (actor ID)
-				result                          // The result (e.g., IND count or any other data)
-		);
-
-		// Send the CompletionMessage back to DependencyMiner
-		message.getDependencyMinerLargeMessageProxy().tell(
-				new LargeMessageProxy.SendMessage(completionMessage, message.getDependencyMinerLargeMessageProxy())
-		);
+        /*LargeMessageProxy.LargeMessage completionMessage = new DependencyMiner.CompletionMessage(this.getContext().getSelf(), result);
+        this.largeMessageProxy.tell(new LargeMessageProxy.SendMessage(completionMessage, message.getDependencyMinerLargeMessageProxy()));
+*/
 		return this;
-
-	}
-	static List<InclusionDependency> inds = new ArrayList<>();
-	private List<InclusionDependency> discoverInds(int fileId1,String file1ColumnHeader,Set<String> file1Columns,
-												   int fileId2,String file2ColumnHeader,Set<String> file2Columns) {
-
-
-		List<InclusionDependency> single_ind = new ArrayList<>();
-		if (file1Columns == null || file2Columns == null) {
-			this.getContext().getLog().error("Columns for file " + fileId1 + " or " + fileId2 + " are null!");
-			return inds; // Return empty list if columns are null
-		}
-
-		// Check if column1's values are a subset of column2's values (this is the IND condition)
-		if (file1Columns.containsAll(file2Columns)) {
-			InclusionDependency ind = new InclusionDependency(
-					new File("file" + fileId1),  // Example, replace with actual file information
-					new String[] {file1ColumnHeader},
-					new File("file" + fileId2),
-					new String[] {file2ColumnHeader}
-			);
-
-			// Add the discovered IND to the list
-			inds.add(ind);
-			single_ind.add(ind);
-			// Optionally log the discovered IND
-			this.getContext().getLog().info(
-					"IND Found: " + " (File " + fileId1 + " "+file1ColumnHeader +") ⊆ " +
-							" (File " + fileId2+ " "+file2ColumnHeader +" Total IND" +inds.size());
-
-		}
-
-		return single_ind;
 	}
 
+	private Behavior<Message> handle(ShutdownMessage message) {
+		return Behaviors.stopped();
+	}
 }
-
 

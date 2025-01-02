@@ -10,19 +10,18 @@ import akka.actor.typed.javadsl.Behaviors;
 import akka.actor.typed.javadsl.Receive;
 import akka.actor.typed.receptionist.Receptionist;
 import akka.actor.typed.receptionist.ServiceKey;
+import de.ddm.actors.Guardian;
 import de.ddm.actors.patterns.LargeMessageProxy;
 import de.ddm.serialization.AkkaSerializable;
 import de.ddm.singletons.InputConfigurationSingleton;
 import de.ddm.singletons.SystemConfigurationSingleton;
 import de.ddm.structures.InclusionDependency;
-import de.ddm.utils.MemoryUtils;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.util.*;
 
 public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
@@ -74,6 +73,30 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		int result;
 	}
 
+	@Getter @Setter
+	@AllArgsConstructor
+	public static class TaskQueueMessage {
+		int fileId1;
+		String file1ColumnHeader;
+		int fileId2;
+		String file2ColumnHeader;
+	}
+
+
+	@Getter @Setter
+	@AllArgsConstructor
+	public static class TransferMessageAcknowledge implements DependencyMiner.Message {
+		ActorRef<DependencyWorker.Message> dependencyWorker;
+		int fileId1;
+		String file1ColumnHeader;
+		int fileId2;
+		String file2ColumnHeader;
+	}
+
+	public static class ShutdownMessage implements Message {
+		private static final long serialVersionUID = 7516129288777469221L;
+	}
+
 	////////////////////////
 	// Actor Construction //
 	////////////////////////
@@ -119,6 +142,20 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 
 	private final List<ActorRef<DependencyWorker.Message>> dependencyWorkers;
 
+	private final Map<Integer, Map<String, Set<String>>> datasetColumnarValues = new HashMap<>();
+	private Map<Integer, Boolean> fileCompletionFlags = new HashMap<>();  // Keep track of file completion
+	private static int inputReaderCounter = 0;
+	private boolean taskQueueReady=false;
+	private final List<ActorRef<DependencyWorker.Message>> pendingRegistrations = new ArrayList<>();
+	private final Map<Integer, Map<String,Boolean>> transferredData = new HashMap<>();
+	private final Queue<TaskQueueMessage> taskQueue = new LinkedList<>();
+	private final Queue<Map<Integer,List<String>>> transferDataQueue = new LinkedList<>();
+	private final Map<ActorRef<DependencyWorker.Message>, Boolean> workerAvailability = new HashMap<>();
+	private final Map<ActorRef<DependencyWorker.Message>, TaskQueueMessage> workerTaskDetails = new HashMap<>();
+	private final Map<Integer, Map<String, Map<Integer, Set<String>>>> indGraph = new HashMap<>(); // Graph to store IND relationships file -> column -> file -> column
+
+
+
 	////////////////////
 	// Actor Behavior //
 	////////////////////
@@ -131,13 +168,35 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 				.onMessage(HeaderMessage.class, this::handle)
 				.onMessage(RegistrationMessage.class, this::handle)
 				.onMessage(CompletionMessage.class, this::handle)
+				.onMessage(TransferMessageAcknowledge.class,this::handle)
+				.onMessage(ShutdownMessage.class, this::handle)
 				.onSignal(Terminated.class, this::handle)
 				.build();
 	}
 
+	private Behavior<Message> handle(ShutdownMessage message){
+		return Behaviors.stopped();
+	}
+
+	private Behavior<Message> handle(TransferMessageAcknowledge transferMessageAcknowledge) {
+		ActorRef<DependencyWorker.Message> worker = transferMessageAcknowledge.dependencyWorker;
+		int fileId1 = transferMessageAcknowledge.getFileId1();
+		String file1ColumnHeader = transferMessageAcknowledge.getFile1ColumnHeader();
+		int fileId2 = transferMessageAcknowledge.getFileId2();
+		String file2ColumnHeader = transferMessageAcknowledge.getFile2ColumnHeader();
+		this.getContext().getLog().info("Data received by worker");
+		workerAvailability.put(worker, true);
+		taskQueue.add(new TaskQueueMessage(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader));
+		return this;
+	}
+
+
 	private Behavior<Message> handle(StartMessage message) {
-		for (ActorRef<InputReader.Message> inputReader : this.inputReaders)
+		for (int i = 0; i < this.inputReaders.size(); i++) {
+			ActorRef<InputReader.Message> inputReader = this.inputReaders.get(i);
+			String fileName = inputFiles[i].getName();
 			inputReader.tell(new InputReader.ReadHeaderMessage(this.getContext().getSelf()));
+		}
 		for (ActorRef<InputReader.Message> inputReader : this.inputReaders)
 			inputReader.tell(new InputReader.ReadBatchMessage(this.getContext().getSelf(), 10000));
 		this.startTime = System.currentTimeMillis();
@@ -149,198 +208,257 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		return this;
 	}
 
-	private final Map<Integer, Map<String, Set<String>>> columnValues = new HashMap<>();
-	private Map<Integer, Boolean> fileCompletionFlags = new HashMap<>();  // Keep track of file completion
-
-	static int inputReaderCounter = 0;
 	private Behavior<Message> handle(BatchMessage message) {
-
-
 		List<String[]> batch = message.getBatch();
 		int fileId = message.getId();
-
-		// Ensure columnValues map is initialized for the file
-		columnValues.putIfAbsent(fileId, new HashMap<>());
-
-		// Process each row in the batch
+		datasetColumnarValues.putIfAbsent(fileId, new HashMap<>());
 		for (String[] row : batch) {
 			for (int colIndex = 0; colIndex < row.length; colIndex++) {
 				String columnName = "Column_" + colIndex;
-				columnValues.get(fileId)
+				datasetColumnarValues.get(fileId)
 						.computeIfAbsent(columnName, k -> new HashSet<>())
 						.add(row[colIndex]);
 			}
 		}
-		// If the batch is empty, this could be the end of data for this file
 		if (batch.isEmpty()) {
-			// If there is no more data, we set a completion flag for the file
 			fileCompletionFlags.put(fileId, true);
 			inputReaderCounter++;
 		}
-		this.getContext().getLog().info("InputReader"+inputReaders.size()+"Count"+inputReaderCounter+"file"+inputFiles.length);
 		if(inputReaderCounter == inputFiles.length) {
-			distributeWorkToWorkers();
+			maintainTaskQueue();
 		}
-
-
 		if (!message.getBatch().isEmpty())
 			this.inputReaders.get(message.getId()).tell(new InputReader.ReadBatchMessage(this.getContext().getSelf(), 10000));
 		else {
 			this.getContext().getLog().info("All batches processed for InputReader " + message.getId());
 		}
-
 		return this;
-
 	}
 
+	private void maintainTaskQueue() {
+		for (Integer fileId1 : datasetColumnarValues.keySet()) {
+			Map<Integer, List<String>> dataMap = new HashMap<>();
+			List<String> columnHeader=new ArrayList<>(datasetColumnarValues.get(fileId1).keySet());
+			dataMap.put(fileId1, columnHeader);
+			transferDataQueue.add(dataMap);
 
-	private int count=0;
-	private void distributeWorkToWorkers() {
-		if(workerAvailable){
-		List<ActorRef<DependencyWorker.Message>> workers = new ArrayList<>();
-
-		for (Integer fileId1 : columnValues.keySet()) {
-			Map<String, Set<String>> dependentColumns = columnValues.get(fileId1);
-
+			Map<String, Set<String>> dependentColumns = datasetColumnarValues.get(fileId1);
 			// Self-comparison within the same file
 			for (Map.Entry<String, Set<String>> dependentEntry : dependentColumns.entrySet()) {
 				for (Map.Entry<String, Set<String>> referencedEntry : dependentColumns.entrySet()) {
 					if (dependentEntry.getKey().equals(referencedEntry.getKey())) continue;
-
-					// Unique worker name for self-comparison
-					String workerName = "dependencyWorker-" + fileId1 + "-self-" + count++;
-					ActorRef<DependencyWorker.Message> worker = this.getContext().spawn(
-							DependencyWorker.create(),
-							workerName
-					);
-
-					workers.add(worker);
-					workerTaskDetails.put(worker, new TaskDetails(
-							fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
-							fileId1, referencedEntry.getKey(), referencedEntry.getValue()
-					));
-
-					// Create a TaskMessage for this combination
-					DependencyWorker.TaskMessage taskMessage = new DependencyWorker.TaskMessage(
-							this.largeMessageProxy,
-							new TaskDetails(
-									fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
-									fileId1, referencedEntry.getKey(), referencedEntry.getValue()
-							)
-					);
-					// Send the TaskMessage to the worker
-					if (dependentEntry.getValue() == null || dependentEntry.getValue().isEmpty() ||
-							referencedEntry.getValue() == null || referencedEntry.getValue().isEmpty())
-						this.getContext().getLog().info("Worker " + workerName + " is empty");
+					taskQueue.add(new TaskQueueMessage(
+							fileId1, dependentEntry.getKey(),
+							fileId1, referencedEntry.getKey()));
 					String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + fileId1 + "-" + referencedEntry.getKey();
-					this.getContext().getLog().info(taskKey + " " + worker);
-
-					worker.tell(taskMessage);
+					//this.getContext().getLog().info( "Create Q"+taskKey);
 				}
 			}
-
 			// Comparison across different files
-			for (Map.Entry<Integer, Map<String, Set<String>>> otherFileEntry : columnValues.entrySet()) {
+			for (Map.Entry<Integer, Map<String, Set<String>>> otherFileEntry : datasetColumnarValues.entrySet()) {
 				int otherFileId = otherFileEntry.getKey();
 				if (otherFileId == fileId1) continue;
-
 				Map<String, Set<String>> referencedColumns = otherFileEntry.getValue();
-
 				for (Map.Entry<String, Set<String>> dependentEntry : dependentColumns.entrySet()) {
 					for (Map.Entry<String, Set<String>> referencedEntry : referencedColumns.entrySet()) {
-
-						// Unique worker name for comparison across files
-						String workerName = "dependencyWorker-" + fileId1 + "-" + otherFileId + "-cross-" + count++;
-						ActorRef<DependencyWorker.Message> worker = this.getContext().spawn(
-								DependencyWorker.create(),
-								workerName
-						);
-						workers.add(worker);
-						workerTaskDetails.put(worker, new TaskDetails(
-								fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
-								otherFileId, referencedEntry.getKey(), referencedEntry.getValue()
+						taskQueue.add(new TaskQueueMessage(
+								fileId1, dependentEntry.getKey(),
+								otherFileId, referencedEntry.getKey()
 						));
-
-						// Create a TaskMessage for this combination
-						DependencyWorker.TaskMessage taskMessage = new DependencyWorker.TaskMessage(
-								this.largeMessageProxy,  // The reference to the LargeMessageProxy actor
-								new TaskDetails(
-										fileId1, dependentEntry.getKey(), dependentEntry.getValue(),
-										otherFileId, referencedEntry.getKey(), referencedEntry.getValue()
-								)   // Second file ID and its columns
-						);
-
-						// Send the TaskMessage to the worker
-						if (dependentEntry.getValue() == null || dependentEntry.getValue().isEmpty() ||
-								referencedEntry.getValue() == null || referencedEntry.getValue().isEmpty())
-							this.getContext().getLog().info("Worker " + workerName + " is empty");
 						String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + otherFileId + "-" + referencedEntry.getKey();
-						this.getContext().getLog().info(taskKey + " Creating " + worker);
-
-						worker.tell(taskMessage);
+						//this.getContext().getLog().info("Create QC"+ taskKey);
 					}
 				}
 			}
 		}
-		}else {
-			this.getContext().getLog().info("No Worker. Waiting for active workers");
-		}
+		taskQueueReady=true;
+		setTaskQueueReady();
 	}
 
-
-	private boolean workerAvailable=false;
 	private Behavior<Message> handle(RegistrationMessage message) {
 		ActorRef<DependencyWorker.Message> dependencyWorker = message.getDependencyWorker();
-		if (!this.dependencyWorkers.contains(dependencyWorker)) {
-			this.dependencyWorkers.add(dependencyWorker);
-			this.getContext().watch(dependencyWorker);
-			if(!workerAvailable) {
-				workerAvailable = true;
-				distributeWorkToWorkers();
-			}
-			// The worker should get some work ... let me send her something before I figure out what I actually want from her.
-			// I probably need to idle the worker for a while, if I do not have work for it right now ... (see master/worker pattern)
-			//this.getContext().getLog().info("Registered dependency worker " + dependencyWorker);
-			//dependencyWorker.tell(new DependencyWorker.TaskMessage(this.largeMessageProxy, 42,null,42,null));
+
+		if (!taskQueueReady) {
+			//this.getContext().getLog().info("Task queue not ready. Queuing worker registration: {}", dependencyWorker);
+			pendingRegistrations.add(dependencyWorker); // Add to pending list
+			return this;
 		}
+
+		// Proceed with registration if taskQueueReady is true
+		registerWorker(dependencyWorker);
 		return this;
-
-
 	}
 
-	private static int ind_Count=0;
+	private void registerWorker(ActorRef<DependencyWorker.Message> dependencyWorker) {
+		if (!dependencyWorkers.contains(dependencyWorker)) {
+			// this.getContext().getLog().info("Worker registered: {}", dependencyWorker);
+			dependencyWorkers.add(dependencyWorker);
+			workerAvailability.put(dependencyWorker, true);
+			this.getContext().watch(dependencyWorker);
+			assignTasksToIdleWorkers();
+			//no task assignment here first will transfer the data to workers once only
+
+		}
+	}
+
+	private void setTaskQueueReady() {
+		if (taskQueueReady){
+			this.getContext().getLog().info("Task queue is now ready. Processing pending registrations...");
+			for (ActorRef<DependencyWorker.Message> worker : pendingRegistrations) {
+				registerWorker(worker);
+			}
+			pendingRegistrations.clear(); // Clear the pending list after processing
+		}
+	}
+	private void assignTasksToIdleWorkers() {
+		for (Map.Entry<ActorRef<DependencyWorker.Message>, Boolean> entry : this.workerAvailability.entrySet()) {
+			if (entry.getValue() && !taskQueue.isEmpty()) {
+				// this.getContext().getLog().info("Assigning task to worker: {}", entry.getKey());
+				assignTaskIfAvailable(entry.getKey());
+			}
+		}
+		if (taskQueue.isEmpty() && workerTaskDetails.isEmpty()) {
+			this.getContext().getLog().info("Shutting down system as taskQueue and workerTaskDetails are empty.");
+			this.end();
+		}
+	}
+
+	private void assignTaskIfAvailable(ActorRef<DependencyWorker.Message> worker) {
+		if (!taskQueue.isEmpty()) {
+
+			TaskQueueMessage task = taskQueue.poll();
+
+			int fileId1 = task.getFileId1();
+			String file1ColumnHeader = task.getFile1ColumnHeader();
+			int fileId2 = task.getFileId2();
+			String file2ColumnHeader = task.getFile2ColumnHeader();
+			if(isTransitive(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader)){
+				addIND(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader);
+				sendResultToCollector(new TaskQueueMessage(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader));
+				assignTasksToIdleWorkers();
+			}
+			else{
+
+
+				String taskId = fileId1 + "-" + file1ColumnHeader + "to" + fileId2 + "-" + file2ColumnHeader;
+				Set<String> firstColumnValues = datasetColumnarValues.get(fileId1).get(file1ColumnHeader);
+				Set<String> secondColumnValues = datasetColumnarValues.get(fileId2).get(file2ColumnHeader);
+
+				workerTaskDetails.put(worker, new TaskQueueMessage(
+						task.getFileId1(), task.getFile1ColumnHeader(),
+						task.getFileId2(), task.getFile2ColumnHeader()
+				));
+
+				int chunkSize = 1000;
+				if (firstColumnValues == null || firstColumnValues.isEmpty() || secondColumnValues == null || secondColumnValues.isEmpty() ) {
+					this.getContext().getLog().error("NDA FileID1: {}, ColumnHeader: {} FileID2: {}, ColumnHeader: {}", fileId1, file1ColumnHeader,fileId2,file2ColumnHeader);
+					// taskQueue.add(task);
+					return;
+				}
+
+				for (int i = 0; i < firstColumnValues.size(); i += chunkSize) {
+					int chunkEndRange = Math.min(i + chunkSize, firstColumnValues.size());
+					Set<String> chunk = new HashSet<>((new ArrayList<>(firstColumnValues)).subList(i, chunkEndRange));
+					boolean isLastChunk = (i + chunkSize >= firstColumnValues.size());
+
+					DataChunkMessage chunkMessage = new DataChunkMessage(
+							this.getContext().getSelf(),  taskId, chunk, true, isLastChunk);
+					// Send each chunk via LargeMessageProxy
+					ActorRef<LargeMessageProxy.Message> workerProxy = this.getContext().spawn(
+							LargeMessageProxy.create(worker.unsafeUpcast()),
+							"workerLargeMessageProxy_" + UUID.randomUUID()
+					);
+					workerProxy.tell(new LargeMessageProxy.SendMessage(chunkMessage, workerProxy));
+				}
+				for (int i = 0; i < secondColumnValues.size(); i += chunkSize) {
+					int chunkEndRange = Math.min(i + chunkSize, secondColumnValues.size());
+					Set<String> chunk = new HashSet<>((new ArrayList<>(secondColumnValues)).subList(i, chunkEndRange));
+					boolean isLastChunk = (i + chunkSize >= secondColumnValues.size());
+
+					DataChunkMessage chunkMessage = new DataChunkMessage(
+							this.getContext().getSelf(),  taskId, chunk, false, isLastChunk);
+					// Send each chunk via LargeMessageProxy
+					ActorRef<LargeMessageProxy.Message> workerProxy = this.getContext().spawn(
+							LargeMessageProxy.create(worker.unsafeUpcast()),
+							"workerLargeMessageProxy_" + UUID.randomUUID()
+					);
+					workerProxy.tell(new LargeMessageProxy.SendMessage(chunkMessage, workerProxy));
+				}
+				workerAvailability.put(worker, false);
+			}
+		}
+	}
+
+	private void sendResultToCollector(TaskQueueMessage taskPerformed){
+		int dependent = taskPerformed.getFileId1();
+		int referenced = taskPerformed.getFileId2();
+		String dependentColumnHeader = taskPerformed.getFile1ColumnHeader();
+		String referencedColumnHeader = taskPerformed.getFile2ColumnHeader();
+		int dependentColNo= Integer.parseInt(dependentColumnHeader.substring(dependentColumnHeader.indexOf("_") + 1));
+		int referencedColNo= Integer.parseInt(referencedColumnHeader.substring(referencedColumnHeader.indexOf("_") + 1));
+		File dependentFile = this.inputFiles[dependent];
+		File referencedFile = this.inputFiles[referenced];
+		String[] dependentAttributes = {this.headerLines[dependent][dependentColNo]};
+		String[] referencedAttributes = {this.headerLines[referenced][referencedColNo]};
+		InclusionDependency ind = new InclusionDependency(dependentFile, dependentAttributes, referencedFile, referencedAttributes);
+		//InclusionDependency ind =new InclusionDependency(new File("file"), new String [] {"attr"},new File("file2"),new String[] {"attr2"});
+
+		List<InclusionDependency> inds=new ArrayList<>(1);
+		inds.add(ind);
+		addIND(dependent,dependentColumnHeader,referenced,referencedColumnHeader);
+		this.getContext().getLog().info("INDS found");
+		this.resultCollector.tell(new ResultCollector.ResultMessage(inds));
+	}
+
+
+
 	private Behavior<Message> handle(CompletionMessage message) {
 		ActorRef<DependencyWorker.Message> dependencyWorker = message.getDependencyWorker();
-		int result = message.getResult();
-
-		// Retrieve task details associated with the worker (dependencyWorker)
-		TaskDetails taskDetails = workerTaskDetails.get(dependencyWorker);
-
-		if (taskDetails != null) {
-			// Process the task details and result
-			int fileId1 = taskDetails.fileId1;
-			String file1ColumnHeader= taskDetails.File1ColumnHeader;
-			Set<String> file1Columns = taskDetails.file1Columns;
-			int fileId2 = taskDetails.fileId2;
-			String file2ColumnHeader= taskDetails.File2ColumnHeader;
-			Set<String> file2Columns = taskDetails.file2Columns;
-
-			// Log or process the result
-			if(result==1) {
-				ind_Count++;
-				this.getContext().getLog().info(
-						"IND Status: " + " (F " + fileId1 +" "+ file1ColumnHeader+ ") ⊆ " +
-								" (F" + fileId2 + " "+ file2ColumnHeader+" Total "   +" count " + ind_Count);
-			}
-			// Optionally, you can perform further processing, aggregate results, or notify other actors
-		} else {
-			this.getContext().getLog().error("No task details found for worker: " + dependencyWorker);
+		TaskQueueMessage taskPerformed=workerTaskDetails.get(dependencyWorker);
+		if(message.getResult()==1){
+			sendResultToCollector(taskPerformed);
 		}
-
-		// Remove the worker from the task details map after processing
 		workerTaskDetails.remove(dependencyWorker);
+		workerAvailability.put(dependencyWorker, true);
+		assignTasksToIdleWorkers();
 		return this;
+	}
 
+	private boolean isTransitive(int fileId1, String file1ColumnHeader, int fileId2, String file2ColumnHeader) {
+		if (!indGraph.containsKey(fileId1) || !indGraph.get(fileId1).containsKey(file1ColumnHeader)) {
+			return false;
+		}
+		Set<String> visited = new HashSet<>();
+		Queue<String> queue = new LinkedList<>();
+		queue.add(fileId1 + ":" + file1ColumnHeader);
+		while (!queue.isEmpty()) {
+			String current = queue.poll();
+			if (current.equals(fileId2 + ":" + file2ColumnHeader)) {
+				this.getContext().getLog().info("Transitive found");
+				return true;
+			}
+			if (visited.add(current)) {
+				String[] parts = current.split(":");
+				int currentFile = Integer.parseInt(parts[0]);
+				String currentColumn = parts[1];
+				if (indGraph.containsKey(currentFile) && indGraph.get(currentFile).containsKey(currentColumn)) {
+					for (Map.Entry<Integer, Set<String>> entry : indGraph.get(currentFile).get(currentColumn).entrySet()) {
+						int nextFile = entry.getKey();
+						for (String nextColumn : entry.getValue()) {
+							queue.add(nextFile + ":" + nextColumn);
+						}
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	private void addIND(int fileA, String columnA, int fileB, String columnB) {
+		indGraph.computeIfAbsent(fileA, k -> new HashMap<>())
+				.computeIfAbsent(columnA, k -> new HashMap<>())
+				.computeIfAbsent(fileB, k -> new HashSet<>())
+				.add(columnB);
 	}
 
 	private void end() {
@@ -352,24 +470,20 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 	private Behavior<Message> handle(Terminated signal) {
 		ActorRef<DependencyWorker.Message> dependencyWorker = signal.getRef().unsafeUpcast();
 		this.dependencyWorkers.remove(dependencyWorker);
+
+        /*if(this.busyWorkers.containsKey(dependencyWorker) && this.busyWorkers.get(dependencyWorker) != null){
+            this.taskKeys.add(this.busyWorkers.get(dependencyWorker));
+            this.busyWorkers.remove(dependencyWorker);
+        }*/
 		return this;
 	}
 
-	private final Map<ActorRef<DependencyWorker.Message>, TaskDetails> workerTaskDetails = new HashMap<>();
-
-	// TaskDetails class to hold the file and column data for each task
-
-
-	@Getter @Setter
-	@AllArgsConstructor
-	public static class TaskDetails {
-		int fileId1;
-		String File1ColumnHeader;
-		Set<String> file1Columns;
-		int fileId2;
-		String File2ColumnHeader;
-		Set<String> file2Columns;
+	private Behavior<Message> handle(Guardian.ShutdownMessage message) {
+		this.getContext().getLog().info("Shutting down Dependency Miner!");
+		return Behaviors.stopped();
 	}
-
 }
+
+
+
 
