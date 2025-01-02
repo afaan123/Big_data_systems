@@ -73,7 +73,8 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		int result;
 	}
 
-	@Getter @Setter
+	@Getter
+	@Setter
 	@AllArgsConstructor
 	public static class TaskQueueMessage {
 		int fileId1;
@@ -82,8 +83,8 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		String file2ColumnHeader;
 	}
 
-
-	@Getter @Setter
+	@Getter
+	@Setter
 	@AllArgsConstructor
 	public static class TransferMessageAcknowledge implements DependencyMiner.Message {
 		ActorRef<DependencyWorker.Message> dependencyWorker;
@@ -103,7 +104,8 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 
 	public static final String DEFAULT_NAME = "dependencyMiner";
 
-	public static final ServiceKey<DependencyMiner.Message> dependencyMinerService = ServiceKey.create(DependencyMiner.Message.class, DEFAULT_NAME + "Service");
+	public static final ServiceKey<DependencyMiner.Message> dependencyMinerService = ServiceKey
+			.create(DependencyMiner.Message.class, DEFAULT_NAME + "Service");
 
 	public static Behavior<Message> create() {
 		return Behaviors.setup(DependencyMiner::new);
@@ -117,9 +119,11 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 
 		this.inputReaders = new ArrayList<>(inputFiles.length);
 		for (int id = 0; id < this.inputFiles.length; id++)
-			this.inputReaders.add(context.spawn(InputReader.create(id, this.inputFiles[id]), InputReader.DEFAULT_NAME + "_" + id));
+			this.inputReaders.add(
+					context.spawn(InputReader.create(id, this.inputFiles[id]), InputReader.DEFAULT_NAME + "_" + id));
 		this.resultCollector = context.spawn(ResultCollector.create(), ResultCollector.DEFAULT_NAME);
-		this.largeMessageProxy = this.getContext().spawn(LargeMessageProxy.create(this.getContext().getSelf().unsafeUpcast()), LargeMessageProxy.DEFAULT_NAME);
+		this.largeMessageProxy = this.getContext().spawn(
+				LargeMessageProxy.create(this.getContext().getSelf().unsafeUpcast()), LargeMessageProxy.DEFAULT_NAME);
 
 		this.dependencyWorkers = new ArrayList<>();
 
@@ -143,18 +147,19 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 	private final List<ActorRef<DependencyWorker.Message>> dependencyWorkers;
 
 	private final Map<Integer, Map<String, Set<String>>> datasetColumnarValues = new HashMap<>();
-	private Map<Integer, Boolean> fileCompletionFlags = new HashMap<>();  // Keep track of file completion
+	private Map<Integer, Boolean> fileCompletionFlags = new HashMap<>(); // Keep track of file completion
 	private static int inputReaderCounter = 0;
-	private boolean taskQueueReady=false;
+	private boolean taskQueueReady = false;
 	private final List<ActorRef<DependencyWorker.Message>> pendingRegistrations = new ArrayList<>();
-	private final Map<Integer, Map<String,Boolean>> transferredData = new HashMap<>();
+	private final Map<Integer, Map<String, Boolean>> transferredData = new HashMap<>();
 	private final Queue<TaskQueueMessage> taskQueue = new LinkedList<>();
-	private final Queue<Map<Integer,List<String>>> transferDataQueue = new LinkedList<>();
+	private final Queue<Map<Integer, List<String>>> transferDataQueue = new LinkedList<>();
 	private final Map<ActorRef<DependencyWorker.Message>, Boolean> workerAvailability = new HashMap<>();
 	private final Map<ActorRef<DependencyWorker.Message>, TaskQueueMessage> workerTaskDetails = new HashMap<>();
-	private final Map<Integer, Map<String, Map<Integer, Set<String>>>> indGraph = new HashMap<>(); // Graph to store IND relationships file -> column -> file -> column
-
-
+	private final Map<Integer, Map<String, Map<Integer, Set<String>>>> indGraph = new HashMap<>(); // Graph to store IND
+																									// relationships
+																									// file -> column ->
+																									// file -> column
 
 	////////////////////
 	// Actor Behavior //
@@ -168,13 +173,13 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 				.onMessage(HeaderMessage.class, this::handle)
 				.onMessage(RegistrationMessage.class, this::handle)
 				.onMessage(CompletionMessage.class, this::handle)
-				.onMessage(TransferMessageAcknowledge.class,this::handle)
+				.onMessage(TransferMessageAcknowledge.class, this::handle)
 				.onMessage(ShutdownMessage.class, this::handle)
 				.onSignal(Terminated.class, this::handle)
 				.build();
 	}
 
-	private Behavior<Message> handle(ShutdownMessage message){
+	private Behavior<Message> handle(ShutdownMessage message) {
 		return Behaviors.stopped();
 	}
 
@@ -186,10 +191,9 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		String file2ColumnHeader = transferMessageAcknowledge.getFile2ColumnHeader();
 		this.getContext().getLog().info("Data received by worker");
 		workerAvailability.put(worker, true);
-		taskQueue.add(new TaskQueueMessage(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader));
+		taskQueue.add(new TaskQueueMessage(fileId1, file1ColumnHeader, fileId2, file2ColumnHeader));
 		return this;
 	}
-
 
 	private Behavior<Message> handle(StartMessage message) {
 		for (int i = 0; i < this.inputReaders.size(); i++) {
@@ -224,11 +228,12 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 			fileCompletionFlags.put(fileId, true);
 			inputReaderCounter++;
 		}
-		if(inputReaderCounter == inputFiles.length) {
+		if (inputReaderCounter == inputFiles.length) {
 			maintainTaskQueue();
 		}
 		if (!message.getBatch().isEmpty())
-			this.inputReaders.get(message.getId()).tell(new InputReader.ReadBatchMessage(this.getContext().getSelf(), 10000));
+			this.inputReaders.get(message.getId())
+					.tell(new InputReader.ReadBatchMessage(this.getContext().getSelf(), 10000));
 		else {
 			this.getContext().getLog().info("All batches processed for InputReader " + message.getId());
 		}
@@ -238,7 +243,7 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 	private void maintainTaskQueue() {
 		for (Integer fileId1 : datasetColumnarValues.keySet()) {
 			Map<Integer, List<String>> dataMap = new HashMap<>();
-			List<String> columnHeader=new ArrayList<>(datasetColumnarValues.get(fileId1).keySet());
+			List<String> columnHeader = new ArrayList<>(datasetColumnarValues.get(fileId1).keySet());
 			dataMap.put(fileId1, columnHeader);
 			transferDataQueue.add(dataMap);
 
@@ -246,32 +251,35 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 			// Self-comparison within the same file
 			for (Map.Entry<String, Set<String>> dependentEntry : dependentColumns.entrySet()) {
 				for (Map.Entry<String, Set<String>> referencedEntry : dependentColumns.entrySet()) {
-					if (dependentEntry.getKey().equals(referencedEntry.getKey())) continue;
+					if (dependentEntry.getKey().equals(referencedEntry.getKey()))
+						continue;
 					taskQueue.add(new TaskQueueMessage(
 							fileId1, dependentEntry.getKey(),
 							fileId1, referencedEntry.getKey()));
-					String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + fileId1 + "-" + referencedEntry.getKey();
-					//this.getContext().getLog().info( "Create Q"+taskKey);
+					String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + fileId1 + "-"
+							+ referencedEntry.getKey();
+					// this.getContext().getLog().info( "Create Q"+taskKey);
 				}
 			}
 			// Comparison across different files
 			for (Map.Entry<Integer, Map<String, Set<String>>> otherFileEntry : datasetColumnarValues.entrySet()) {
 				int otherFileId = otherFileEntry.getKey();
-				if (otherFileId == fileId1) continue;
+				if (otherFileId == fileId1)
+					continue;
 				Map<String, Set<String>> referencedColumns = otherFileEntry.getValue();
 				for (Map.Entry<String, Set<String>> dependentEntry : dependentColumns.entrySet()) {
 					for (Map.Entry<String, Set<String>> referencedEntry : referencedColumns.entrySet()) {
 						taskQueue.add(new TaskQueueMessage(
 								fileId1, dependentEntry.getKey(),
-								otherFileId, referencedEntry.getKey()
-						));
-						String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + otherFileId + "-" + referencedEntry.getKey();
-						//this.getContext().getLog().info("Create QC"+ taskKey);
+								otherFileId, referencedEntry.getKey()));
+						String taskKey = fileId1 + "-" + dependentEntry.getKey() + "-" + otherFileId + "-"
+								+ referencedEntry.getKey();
+						// this.getContext().getLog().info("Create QC"+ taskKey);
 					}
 				}
 			}
 		}
-		taskQueueReady=true;
+		taskQueueReady = true;
 		setTaskQueueReady();
 	}
 
@@ -279,7 +287,8 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		ActorRef<DependencyWorker.Message> dependencyWorker = message.getDependencyWorker();
 
 		if (!taskQueueReady) {
-			//this.getContext().getLog().info("Task queue not ready. Queuing worker registration: {}", dependencyWorker);
+			// this.getContext().getLog().info("Task queue not ready. Queuing worker
+			// registration: {}", dependencyWorker);
 			pendingRegistrations.add(dependencyWorker); // Add to pending list
 			return this;
 		}
@@ -296,13 +305,13 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 			workerAvailability.put(dependencyWorker, true);
 			this.getContext().watch(dependencyWorker);
 			assignTasksToIdleWorkers();
-			//no task assignment here first will transfer the data to workers once only
+			// no task assignment here first will transfer the data to workers once only
 
 		}
 	}
 
 	private void setTaskQueueReady() {
-		if (taskQueueReady){
+		if (taskQueueReady) {
 			this.getContext().getLog().info("Task queue is now ready. Processing pending registrations...");
 			for (ActorRef<DependencyWorker.Message> worker : pendingRegistrations) {
 				registerWorker(worker);
@@ -310,10 +319,12 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 			pendingRegistrations.clear(); // Clear the pending list after processing
 		}
 	}
+
 	private void assignTasksToIdleWorkers() {
 		for (Map.Entry<ActorRef<DependencyWorker.Message>, Boolean> entry : this.workerAvailability.entrySet()) {
 			if (entry.getValue() && !taskQueue.isEmpty()) {
-				// this.getContext().getLog().info("Assigning task to worker: {}", entry.getKey());
+				// this.getContext().getLog().info("Assigning task to worker: {}",
+				// entry.getKey());
 				assignTaskIfAvailable(entry.getKey());
 			}
 		}
@@ -332,13 +343,11 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 			String file1ColumnHeader = task.getFile1ColumnHeader();
 			int fileId2 = task.getFileId2();
 			String file2ColumnHeader = task.getFile2ColumnHeader();
-			if(isTransitive(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader)){
-				addIND(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader);
-				sendResultToCollector(new TaskQueueMessage(fileId1,file1ColumnHeader,fileId2,file2ColumnHeader));
+			if (isTransitive(fileId1, file1ColumnHeader, fileId2, file2ColumnHeader)) {
+				addIND(fileId1, file1ColumnHeader, fileId2, file2ColumnHeader);
+				sendResultToCollector(new TaskQueueMessage(fileId1, file1ColumnHeader, fileId2, file2ColumnHeader));
 				assignTasksToIdleWorkers();
-			}
-			else{
-
+			} else {
 
 				String taskId = fileId1 + "-" + file1ColumnHeader + "to" + fileId2 + "-" + file2ColumnHeader;
 				Set<String> firstColumnValues = datasetColumnarValues.get(fileId1).get(file1ColumnHeader);
@@ -346,12 +355,13 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 
 				workerTaskDetails.put(worker, new TaskQueueMessage(
 						task.getFileId1(), task.getFile1ColumnHeader(),
-						task.getFileId2(), task.getFile2ColumnHeader()
-				));
+						task.getFileId2(), task.getFile2ColumnHeader()));
 
 				int chunkSize = 1000;
-				if (firstColumnValues == null || firstColumnValues.isEmpty() || secondColumnValues == null || secondColumnValues.isEmpty() ) {
-					this.getContext().getLog().error("NDA FileID1: {}, ColumnHeader: {} FileID2: {}, ColumnHeader: {}", fileId1, file1ColumnHeader,fileId2,file2ColumnHeader);
+				if (firstColumnValues == null || firstColumnValues.isEmpty() || secondColumnValues == null
+						|| secondColumnValues.isEmpty()) {
+					this.getContext().getLog().error("NDA FileID1: {}, ColumnHeader: {} FileID2: {}, ColumnHeader: {}",
+							fileId1, file1ColumnHeader, fileId2, file2ColumnHeader);
 					// taskQueue.add(task);
 					return;
 				}
@@ -362,12 +372,11 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 					boolean isLastChunk = (i + chunkSize >= firstColumnValues.size());
 
 					DataChunkMessage chunkMessage = new DataChunkMessage(
-							this.getContext().getSelf(),  taskId, chunk, true, isLastChunk);
+							this.getContext().getSelf(), taskId, chunk, true, isLastChunk);
 					// Send each chunk via LargeMessageProxy
 					ActorRef<LargeMessageProxy.Message> workerProxy = this.getContext().spawn(
 							LargeMessageProxy.create(worker.unsafeUpcast()),
-							"workerLargeMessageProxy_" + UUID.randomUUID()
-					);
+							"workerLargeMessageProxy_" + UUID.randomUUID());
 					workerProxy.tell(new LargeMessageProxy.SendMessage(chunkMessage, workerProxy));
 				}
 				for (int i = 0; i < secondColumnValues.size(); i += chunkSize) {
@@ -376,12 +385,11 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 					boolean isLastChunk = (i + chunkSize >= secondColumnValues.size());
 
 					DataChunkMessage chunkMessage = new DataChunkMessage(
-							this.getContext().getSelf(),  taskId, chunk, false, isLastChunk);
+							this.getContext().getSelf(), taskId, chunk, false, isLastChunk);
 					// Send each chunk via LargeMessageProxy
 					ActorRef<LargeMessageProxy.Message> workerProxy = this.getContext().spawn(
 							LargeMessageProxy.create(worker.unsafeUpcast()),
-							"workerLargeMessageProxy_" + UUID.randomUUID()
-					);
+							"workerLargeMessageProxy_" + UUID.randomUUID());
 					workerProxy.tell(new LargeMessageProxy.SendMessage(chunkMessage, workerProxy));
 				}
 				workerAvailability.put(worker, false);
@@ -389,33 +397,34 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		}
 	}
 
-	private void sendResultToCollector(TaskQueueMessage taskPerformed){
+	private void sendResultToCollector(TaskQueueMessage taskPerformed) {
 		int dependent = taskPerformed.getFileId1();
 		int referenced = taskPerformed.getFileId2();
 		String dependentColumnHeader = taskPerformed.getFile1ColumnHeader();
 		String referencedColumnHeader = taskPerformed.getFile2ColumnHeader();
-		int dependentColNo= Integer.parseInt(dependentColumnHeader.substring(dependentColumnHeader.indexOf("_") + 1));
-		int referencedColNo= Integer.parseInt(referencedColumnHeader.substring(referencedColumnHeader.indexOf("_") + 1));
+		int dependentColNo = Integer.parseInt(dependentColumnHeader.substring(dependentColumnHeader.indexOf("_") + 1));
+		int referencedColNo = Integer
+				.parseInt(referencedColumnHeader.substring(referencedColumnHeader.indexOf("_") + 1));
 		File dependentFile = this.inputFiles[dependent];
 		File referencedFile = this.inputFiles[referenced];
-		String[] dependentAttributes = {this.headerLines[dependent][dependentColNo]};
-		String[] referencedAttributes = {this.headerLines[referenced][referencedColNo]};
-		InclusionDependency ind = new InclusionDependency(dependentFile, dependentAttributes, referencedFile, referencedAttributes);
-		//InclusionDependency ind =new InclusionDependency(new File("file"), new String [] {"attr"},new File("file2"),new String[] {"attr2"});
+		String[] dependentAttributes = { this.headerLines[dependent][dependentColNo] };
+		String[] referencedAttributes = { this.headerLines[referenced][referencedColNo] };
+		InclusionDependency ind = new InclusionDependency(dependentFile, dependentAttributes, referencedFile,
+				referencedAttributes);
+		// InclusionDependency ind =new InclusionDependency(new File("file"), new String
+		// [] {"attr"},new File("file2"),new String[] {"attr2"});
 
-		List<InclusionDependency> inds=new ArrayList<>(1);
+		List<InclusionDependency> inds = new ArrayList<>(1);
 		inds.add(ind);
-		addIND(dependent,dependentColumnHeader,referenced,referencedColumnHeader);
+		addIND(dependent, dependentColumnHeader, referenced, referencedColumnHeader);
 		this.getContext().getLog().info("INDS found");
 		this.resultCollector.tell(new ResultCollector.ResultMessage(inds));
 	}
 
-
-
 	private Behavior<Message> handle(CompletionMessage message) {
 		ActorRef<DependencyWorker.Message> dependencyWorker = message.getDependencyWorker();
-		TaskQueueMessage taskPerformed=workerTaskDetails.get(dependencyWorker);
-		if(message.getResult()==1){
+		TaskQueueMessage taskPerformed = workerTaskDetails.get(dependencyWorker);
+		if (message.getResult() == 1) {
 			sendResultToCollector(taskPerformed);
 		}
 		workerTaskDetails.remove(dependencyWorker);
@@ -442,7 +451,8 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 				int currentFile = Integer.parseInt(parts[0]);
 				String currentColumn = parts[1];
 				if (indGraph.containsKey(currentFile) && indGraph.get(currentFile).containsKey(currentColumn)) {
-					for (Map.Entry<Integer, Set<String>> entry : indGraph.get(currentFile).get(currentColumn).entrySet()) {
+					for (Map.Entry<Integer, Set<String>> entry : indGraph.get(currentFile).get(currentColumn)
+							.entrySet()) {
 						int nextFile = entry.getKey();
 						for (String nextColumn : entry.getValue()) {
 							queue.add(nextFile + ":" + nextColumn);
@@ -471,19 +481,19 @@ public class DependencyMiner extends AbstractBehavior<DependencyMiner.Message> {
 		ActorRef<DependencyWorker.Message> dependencyWorker = signal.getRef().unsafeUpcast();
 		this.dependencyWorkers.remove(dependencyWorker);
 
-        /*if(this.busyWorkers.containsKey(dependencyWorker) && this.busyWorkers.get(dependencyWorker) != null){
-            this.taskKeys.add(this.busyWorkers.get(dependencyWorker));
-            this.busyWorkers.remove(dependencyWorker);
-        }*/
+		/*
+		 * if(this.busyWorkers.containsKey(dependencyWorker) &&
+		 * this.busyWorkers.get(dependencyWorker) != null){
+		 * this.taskKeys.add(this.busyWorkers.get(dependencyWorker));
+		 * this.busyWorkers.remove(dependencyWorker);
+		 * }
+		 */
 		return this;
 	}
 
-	private Behavior<Message> handle(Guardian.ShutdownMessage message) {
-		this.getContext().getLog().info("Shutting down Dependency Miner!");
-		return Behaviors.stopped();
-	}
+	// private Behavior<Message> handle(Guardian.ShutdownMessage message) {
+	// this.getContext().getLog().info("Shutting down Dependency Miner!");
+	// return Behaviors.stopped();
+	// }
+
 }
-
-
-
-
